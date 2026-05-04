@@ -1,0 +1,881 @@
+-- ============================================================
+-- SONDER HUB  v5.2
+-- ============================================================
+
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local UIS             = game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+local ContentProvider = game:GetService("ContentProvider")
+local Stats           = game:GetService("Stats")
+local LP              = Players.LocalPlayer
+
+local _isfile   = isfile   or (syn and syn.isfile)   or (getgenv and getgenv().isfile)   or function() return false end
+local _readfile = readfile  or (syn and syn.readfile)  or (getgenv and getgenv().readfile)  or function() return nil  end
+local _writefile= writefile or (syn and syn.writefile) or (getgenv and getgenv().writefile) or function() end
+local getconnections = getconnections or get_signal_cons or getconnects or (syn and syn.get_signal_cons)
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local State = {
+    normalSpeed=60, carrySpeed=30, laggerSpeed=10.1,
+    speedToggled=false, laggerEnabled=false,
+    infJumpEnabled=false, antiRagdollEnabled=false, fpsBoostEnabled=false,
+    guiVisible=true, uiLocked=false,
+    isStealing=false, stealStartTime=nil, lastStealTick=0,
+    autoLeftEnabled=false, autoRightEnabled=false,
+    autoLeftPhase=1, autoRightPhase=1,
+    medusaLastUsed=0, medusaDebounce=false, medusaCounterEnabled=false,
+    batAimbotToggled=false, autoSwingEnabled=false,
+    hittingCooldown=false,
+    batCounterEnabled=false, batCounterDebounce=false,
+    dropEnabled=false, _tpInProgress=false,
+    lastMoveDir=Vector3.new(0,0,0),
+    unwalkEnabled=false, stackButtonsHidden=false,
+    _prevCarry=30, _prevSpeed=false,
+    duelCountdownEnabled=false, _duelWaiting=false,
+}
+
+local Keys = {
+    speed=Enum.KeyCode.Q, guiHide=Enum.KeyCode.LeftControl,
+    autoLeft=Enum.KeyCode.L, autoRight=Enum.KeyCode.R,
+    lagger=Enum.KeyCode.Unknown, tpDown=Enum.KeyCode.Unknown,
+    drop=Enum.KeyCode.H, aimbot=Enum.KeyCode.Unknown,
+}
+
+-- ============================================================
+-- DEFAULT STACK BUTTON POSITIONS (for reset)
+-- ============================================================
+local BTN_W=64; local BTN_H=54; local BTN_GAP=5; local COLS=2
+local stackDefs = {
+    {key="autoLeft",   label="AUTO\nLEFT"},
+    {key="autoRight",  label="AUTO\nRIGHT"},
+    {key="aimbot",     label="AIMBOT"},
+    {key="lagger",     label="LAGGER\nMODE"},
+    {key="drop",       label="DROP\nBR"},
+    {key="tpDown",     label="TP\nDOWN"},
+    {key="carrySpeed", label="CARRY\nSPEED"},
+}
+local GRID_W=COLS*(BTN_W+BTN_GAP)-BTN_GAP
+local GRID_H=math.ceil(#stackDefs/COLS)*(BTN_H+BTN_GAP)-BTN_GAP
+
+local function getDefaultStackPos(i)
+    local col=(i-1)%COLS
+    local row2=math.floor((i-1)/COLS)
+    return UDim2.new(1,-(GRID_W+14)+col*(BTN_W+BTN_GAP),0.5,-(GRID_H/2)+row2*(BTN_H+BTN_GAP))
+end
+
+local Steal = {
+    AutoStealEnabled=false, StealRadius=20, StealDuration=0.25,
+    Data={}, plotCache={}, plotCacheTime={}, cachedPrompts={}, promptCacheTime=0,
+}
+
+-- ============================================================
+-- PRESETS
+-- ============================================================
+local Presets = {}
+local PRESET_FILE = "SonderHubPresets.json"
+local LAST_PRESET_FILE = "SonderHubLastPreset.json"
+local CONFIG_FILE = "SonderHubConfig.json"
+
+local function buildPresetSnapshot()
+    return {
+        normalSpeed   = State.normalSpeed,
+        carrySpeed    = State.carrySpeed,
+        laggerSpeed   = State.laggerSpeed,
+        stealRadius   = Steal.StealRadius,
+        stealDuration = Steal.StealDuration,
+        infJump       = State.infJumpEnabled,
+        antiRagdoll   = State.antiRagdollEnabled,
+        fpsBoost      = State.fpsBoostEnabled,
+        medusaCounter = State.medusaCounterEnabled,
+        batCounter    = State.batCounterEnabled,
+        autoSteal     = Steal.AutoStealEnabled,
+    }
+end
+
+local function savePresetsFile()
+    local ok,encoded=pcall(function() return HttpService:JSONEncode(Presets) end)
+    if ok then pcall(function() _writefile(PRESET_FILE,encoded) end) end
+end
+
+local function loadPresetsFile()
+    local hasFile=false; pcall(function() hasFile=_isfile(PRESET_FILE) end)
+    if not hasFile then return end
+    local raw; pcall(function() raw=_readfile(PRESET_FILE) end)
+    if not raw then return end
+    local ok,decoded=pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok and decoded then Presets=decoded end
+end
+
+local function saveLastPresetName(name)
+    local ok, encoded = pcall(function() return HttpService:JSONEncode({lastPreset=name}) end)
+    if ok then pcall(function() _writefile(LAST_PRESET_FILE, encoded) end) end
+end
+
+local function loadLastPresetName()
+    local hasFile = false; pcall(function() hasFile = _isfile(LAST_PRESET_FILE) end)
+    if not hasFile then return nil end
+    local raw; pcall(function() raw = _readfile(LAST_PRESET_FILE) end)
+    if not raw then return nil end
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok and decoded then return decoded.lastPreset end
+    return nil
+end
+
+local MOVE_KEYS={[Enum.KeyCode.W]=true,[Enum.KeyCode.A]=true,[Enum.KeyCode.S]=true,[Enum.KeyCode.D]=true,
+    [Enum.KeyCode.Up]=true,[Enum.KeyCode.Left]=true,[Enum.KeyCode.Down]=true,[Enum.KeyCode.Right]=true}
+
+local PLOT_CACHE_DURATION=2; local PROMPT_CACHE_REFRESH=0.15
+local STEAL_COOLDOWN=0.1; local MEDUSA_COOLDOWN=25; local DROP_AUTO_OFF_DELAY=0.15
+
+local POS={
+    L1=Vector3.new(-476.48,-6.28,92.73), L2=Vector3.new(-483.12,-4.95,94.80),
+    R1=Vector3.new(-476.16,-6.52,25.62), R2=Vector3.new(-483.04,-5.09,23.14),
+}
+
+local Conns={autoSteal=nil,antiRag=nil,autoLeft=nil,autoRight=nil,aimbot=nil,anchor={},progress=nil,batCounter=nil,unwalk=nil}
+
+local h,hrp
+local setAutoLeft,setAutoRight,setInfJump,setAntiRag,setFps
+local setMedusaCounter,setUnwalkToggle,setAimbot,setAutoSwing
+local setLagger,setDropBrainrot,setInstaGrab
+local setupMedusaCounter,stopMedusaCounter,startAntiRagdoll,stopAntiRagdoll
+local applyFPSBoost,startAutoSteal,stopAutoSteal
+local startAutoLeft,stopAutoLeft,startAutoRight,stopAutoRight
+local saveConfig,loadConfig,runDropBrainrot,stopDropBrainrot,doTpDown
+local startBatAimbot,stopBatAimbot,startBatCounter,stopBatCounter,setBatCounter
+local stackBtnRefs={}; local stackWrappers={}; local keybindBtnRefs={}
+local normalBox,carryBox,laggerBox,uiScaleBox,stealRadBox,lockBtn
+local setHideButtonsToggle
+local radTB
+
+local presetListFrame=nil
+local presetNameBox=nil
+local rebuildPresetList
+
+-- ============================================================
+-- COLORS  (Black & Red theme)
+-- ============================================================
+local C = {
+    winBg       = Color3.fromRGB(10, 0, 0),
+    winBorder   = Color3.fromRGB(120, 0, 0),
+    topBg       = Color3.fromRGB(10, 0, 0),
+    topTitle    = Color3.fromRGB(255, 60, 60),
+    topSub      = Color3.fromRGB(120, 0, 0),
+    topBtn      = Color3.fromRGB(180, 0, 0),
+    topBtnHov   = Color3.fromRGB(220, 30, 30),
+    topDivider  = Color3.fromRGB(80, 0, 0),
+    tabBarBg    = Color3.fromRGB(15, 0, 0),
+    tabBarDiv   = Color3.fromRGB(80, 0, 0),
+    tabIdle     = Color3.fromRGB(140, 40, 40),
+    tabActive   = Color3.fromRGB(255, 80, 80),
+    tabActiveBg = Color3.fromRGB(40, 0, 0),
+    tabUnderline= Color3.fromRGB(220, 0, 0),
+    sectionTxt  = Color3.fromRGB(160, 0, 0),
+    sectionDiv  = Color3.fromRGB(40, 0, 0),
+    rowBg       = Color3.fromRGB(0,  0,  0),
+    rowBorder   = Color3.fromRGB(60, 0, 0),
+    rowLabel    = Color3.fromRGB(220, 180, 180),
+    rowSub      = Color3.fromRGB(130, 50, 50),
+    rowValue    = Color3.fromRGB(200, 120, 120),
+    rowHov      = Color3.fromRGB(30, 0, 0),
+    inputBg     = Color3.fromRGB(20, 0, 0),
+    inputBorder = Color3.fromRGB(80, 0, 0),
+    inputFocus  = Color3.fromRGB(200, 0, 0),
+    inputTxt    = Color3.fromRGB(255, 180, 180),
+    pillOff     = Color3.fromRGB(40, 0, 0),
+    pillOn      = Color3.fromRGB(160, 0, 0),
+    dotOff      = Color3.fromRGB(80, 20, 20),
+    dotOn       = Color3.fromRGB(255, 80, 80),
+    pillBorder  = Color3.fromRGB(100, 0, 0),
+    modeBtnBg   = Color3.fromRGB(20, 0, 0),
+    modeBtnBrd  = Color3.fromRGB(70, 0, 0),
+    modeBtnTxt  = Color3.fromRGB(130, 40, 40),
+    modeBtnActBg= Color3.fromRGB(100, 0, 0),
+    modeBtnActTx= Color3.fromRGB(255, 180, 180),
+    chipBg      = Color3.fromRGB(20, 0, 0),
+    chipBorder  = Color3.fromRGB(80, 0, 0),
+    chipTxt     = Color3.fromRGB(160, 40, 40),
+    btnBg       = Color3.fromRGB(30, 0, 0),
+    btnBorder   = Color3.fromRGB(100, 0, 0),
+    btnTxt      = Color3.fromRGB(220, 100, 100),
+    btnHov      = Color3.fromRGB(60, 0, 0),
+    stackBg     = Color3.fromRGB(12, 0, 0),
+    stackBrd    = Color3.fromRGB(60, 0, 0),
+    stackTxt    = Color3.fromRGB(130, 30, 30),
+    stackActBg  = Color3.fromRGB(50, 0, 0),
+    stackActBrd = Color3.fromRGB(200, 0, 0),
+    stackActTxt = Color3.fromRGB(255, 150, 150),
+    stackDot    = Color3.fromRGB(50, 0, 0),
+    stackDotOn  = Color3.fromRGB(200, 0, 0),
+    infoBg      = Color3.fromRGB(8, 0, 0),
+    infoBrd     = Color3.fromRGB(60, 0, 0),
+    infoTxt     = Color3.fromRGB(120, 30, 30),
+    infoVal     = Color3.fromRGB(220, 100, 100),
+    infoFill    = Color3.fromRGB(180, 0, 0),
+    accent      = Color3.fromRGB(140, 0, 0),
+    accentDim   = Color3.fromRGB(60, 0, 0),
+    presetBg    = Color3.fromRGB(18, 0, 0),
+    presetBrd   = Color3.fromRGB(80, 0, 0),
+    presetLoad  = Color3.fromRGB(80, 0, 0),
+    presetDel   = Color3.fromRGB(60, 10, 10),
+    delBrd      = Color3.fromRGB(120, 20, 20),
+    lockOn      = Color3.fromRGB(255, 80, 80),
+    divider     = Color3.fromRGB(60, 0, 0),
+}
+
+-- ============================================================
+-- CLEANUP
+-- ============================================================
+for _,name in pairs({"SonderHubV5_2","SonderHubGUI"}) do
+    pcall(function() local o=game:GetService("CoreGui"):FindFirstChild(name); if o then o:Destroy() end end)
+    pcall(function() local o=LP:WaitForChild("PlayerGui"):FindFirstChild(name); if o then o:Destroy() end end)
+end
+
+-- ============================================================
+-- ROOT GUI
+-- ============================================================
+local gui=Instance.new("ScreenGui")
+gui.Name="SonderHubV5_2"; gui.ResetOnSpawn=false; gui.DisplayOrder=10
+gui.IgnoreGuiInset=true; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+gui.Parent=LP:WaitForChild("PlayerGui")
+
+local uiScaleObj=Instance.new("UIScale",gui); uiScaleObj.Scale=1.0
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function mkCorner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 6); return c end
+local function mkStroke(p,col,th)
+    local s=Instance.new("UIStroke",p); s.Color=col; s.Thickness=th or 1
+    s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; return s
+end
+local function mkPad(p,t,b,l,r)
+    local pd=Instance.new("UIPadding",p)
+    pd.PaddingTop=UDim.new(0,t or 0); pd.PaddingBottom=UDim.new(0,b or 0)
+    pd.PaddingLeft=UDim.new(0,l or 0); pd.PaddingRight=UDim.new(0,r or 0)
+    return pd
+end
+
+-- ============================================================
+-- DRAG
+-- ============================================================
+local function makeDraggable(frame,handle)
+    local src=handle or frame
+    local dragging,dragInput,dragStart,startPos=false,nil,nil,nil
+    src.InputBegan:Connect(function(inp)
+        if State.uiLocked then return end
+        if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
+            dragging=true; dragStart=inp.Position; startPos=frame.Position
+            inp.Changed:Connect(function() if inp.UserInputState==Enum.UserInputState.End then dragging=false end end)
+        end
+    end)
+    src.InputChanged:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch then dragInput=inp end
+    end)
+    UIS.InputChanged:Connect(function(inp)
+        if inp==dragInput and dragging and not State.uiLocked then
+            local dx=inp.Position.X-dragStart.X; local dy=inp.Position.Y-dragStart.Y
+            frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+dx,startPos.Y.Scale,startPos.Y.Offset+dy)
+        end
+    end)
+end
+
+local function makeStackDraggable(frame,onTap)
+    local dragging,dragInput,dragStart,startPos=false,nil,nil,nil; local moved=false
+    frame.InputBegan:Connect(function(inp)
+        if inp.UserInputType~=Enum.UserInputType.MouseButton1 and inp.UserInputType~=Enum.UserInputType.Touch then return end
+        dragging=true; moved=false; dragStart=inp.Position; startPos=frame.Position
+        inp.Changed:Connect(function()
+            if inp.UserInputState==Enum.UserInputState.End then
+                if not moved and onTap then onTap() end; dragging=false; moved=false
+            end
+        end)
+    end)
+    frame.InputChanged:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch then dragInput=inp end
+    end)
+    UIS.InputChanged:Connect(function(inp)
+        if inp~=dragInput or not dragging then return end
+        local dx=inp.Position.X-dragStart.X; local dy=inp.Position.Y-dragStart.Y
+        if math.abs(dx)>4 or math.abs(dy)>4 then moved=true end
+        if moved and not State.uiLocked then
+            frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+dx,startPos.Y.Scale,startPos.Y.Offset+dy)
+        end
+    end)
+end
+
+-- ============================================================
+-- MAIN WINDOW
+-- ============================================================
+local WIN_W = 360
+local WIN_H = 440
+local TITLE_H = 38
+local TAB_H   = 34
+
+local mainOuter = Instance.new("Frame", gui)
+mainOuter.Name = "MainOuter"
+mainOuter.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+mainOuter.Position = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2)
+mainOuter.BackgroundTransparency = 1
+mainOuter.BorderSizePixel = 0
+mainOuter.ClipsDescendants = true
+mkCorner(mainOuter, 8)
+mkStroke(mainOuter, C.winBorder, 1)
+makeDraggable(mainOuter)
+
+local bgImg = Instance.new("ImageLabel", mainOuter)
+bgImg.Name = "BgImage"
+bgImg.Size = UDim2.new(1, 0, 1, 0)
+bgImg.Position = UDim2.new(0, 0, 0, 0)
+bgImg.BackgroundColor3 = C.winBg
+bgImg.BackgroundTransparency = 0
+bgImg.Image = ""
+bgImg.ScaleType = Enum.ScaleType.Crop
+bgImg.ImageTransparency = 1
+bgImg.ZIndex = 0
+mkCorner(bgImg, 8)
+
+local bgOverlay = Instance.new("Frame", mainOuter)
+bgOverlay.Size = UDim2.new(1, 0, 1, 0)
+bgOverlay.BackgroundColor3 = Color3.fromRGB(5, 0, 0)
+bgOverlay.BackgroundTransparency = 0.1
+bgOverlay.BorderSizePixel = 0
+bgOverlay.ZIndex = 1
+mkCorner(bgOverlay, 8)
+
+-- ============================================================
+-- TITLE BAR
+-- ============================================================
+local titleBar = Instance.new("Frame", mainOuter)
+titleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
+titleBar.BackgroundColor3 = C.topBg
+titleBar.BackgroundTransparency = 1
+titleBar.BorderSizePixel = 0
+titleBar.ZIndex = 5
+
+local titleLbl = Instance.new("TextLabel", titleBar)
+titleLbl.Size = UDim2.new(0, 180, 1, 0)
+titleLbl.Position = UDim2.new(0, 12, 0, 0)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text = "⚡ Sonder Hub"
+titleLbl.TextColor3 = C.topTitle
+titleLbl.Font = Enum.Font.GothamBlack
+titleLbl.TextSize = 14
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.TextStrokeTransparency = 0.5
+titleLbl.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+titleLbl.ZIndex = 6
+
+local closeBtn = Instance.new("TextButton", titleBar)
+closeBtn.Size = UDim2.new(0, 22, 0, 22)
+closeBtn.Position = UDim2.new(1, -32, 0.5, -11)
+closeBtn.BackgroundColor3 = C.modeBtnBg
+closeBtn.BorderSizePixel = 0
+closeBtn.Text = "×"
+closeBtn.TextColor3 = C.topBtn
+closeBtn.Font = Enum.Font.GothamBlack
+closeBtn.TextSize = 16
+closeBtn.ZIndex = 7
+mkCorner(closeBtn, 5)
+mkStroke(closeBtn, C.chipBorder, 1)
+closeBtn.MouseEnter:Connect(function() TweenService:Create(closeBtn, TweenInfo.new(0.1), {TextColor3 = Color3.fromRGB(255,50,50)}):Play() end)
+closeBtn.MouseLeave:Connect(function() TweenService:Create(closeBtn, TweenInfo.new(0.1), {TextColor3 = C.topBtn}):Play() end)
+closeBtn.MouseButton1Click:Connect(function() State.guiVisible = false; mainOuter.Visible = false end)
+
+lockBtn = Instance.new("TextButton", titleBar)
+lockBtn.Size = UDim2.new(0, 22, 0, 22)
+lockBtn.Position = UDim2.new(1, -58, 0.5, -11)
+lockBtn.BackgroundColor3 = C.modeBtnBg
+lockBtn.BorderSizePixel = 0
+lockBtn.Text = "🔓"
+lockBtn.Font = Enum.Font.GothamBold
+lockBtn.TextSize = 11
+lockBtn.ZIndex = 7
+mkCorner(lockBtn, 5)
+mkStroke(lockBtn, C.chipBorder, 1)
+lockBtn.MouseButton1Click:Connect(function()
+    State.uiLocked = not State.uiLocked
+    lockBtn.Text = State.uiLocked and "🔒" or "🔓"
+end)
+
+local titleDiv = Instance.new("Frame", mainOuter)
+titleDiv.Size = UDim2.new(1, 0, 0, 1)
+titleDiv.Position = UDim2.new(0, 0, 0, TITLE_H)
+titleDiv.BackgroundColor3 = C.topDivider
+titleDiv.BorderSizePixel = 0
+titleDiv.ZIndex = 5
+
+-- ============================================================
+-- HORIZONTAL TAB BAR
+-- ============================================================
+local tabBar = Instance.new("Frame", mainOuter)
+tabBar.Size = UDim2.new(1, 0, 0, TAB_H)
+tabBar.Position = UDim2.new(0, 0, 0, TITLE_H + 1)
+tabBar.BackgroundColor3 = C.tabBarBg
+tabBar.BackgroundTransparency = 1
+tabBar.BorderSizePixel = 0
+tabBar.ZIndex = 5
+
+local tabBarLL = Instance.new("UIListLayout", tabBar)
+tabBarLL.FillDirection = Enum.FillDirection.Horizontal
+tabBarLL.SortOrder = Enum.SortOrder.LayoutOrder
+tabBarLL.Padding = UDim.new(0, 0)
+
+local tabDiv = Instance.new("Frame", mainOuter)
+tabDiv.Size = UDim2.new(1, 0, 0, 1)
+tabDiv.Position = UDim2.new(0, 0, 0, TITLE_H + 1 + TAB_H)
+tabDiv.BackgroundColor3 = C.tabBarDiv
+tabDiv.BorderSizePixel = 0
+tabDiv.ZIndex = 5
+
+-- ============================================================
+-- CONTENT AREA
+-- ============================================================
+local CONTENT_Y = TITLE_H + 1 + TAB_H + 1
+local contentBg = Instance.new("Frame", mainOuter)
+contentBg.Size = UDim2.new(1, 0, 1, -CONTENT_Y)
+contentBg.Position = UDim2.new(0, 0, 0, CONTENT_Y)
+contentBg.BackgroundColor3 = C.winBg
+contentBg.BackgroundTransparency = 1
+contentBg.BorderSizePixel = 0
+contentBg.ClipsDescendants = true
+contentBg.ZIndex = 2
+
+-- ============================================================
+-- TAB SYSTEM
+-- ============================================================
+local TABS = {"Speed", "Bat Aimbot", "Mechanics", "Movement", "Settings"}
+local currentTab = "Speed"
+local tabBtns = {}; local tabPages = {}
+
+local TAB_COUNT = #TABS
+for i, name in ipairs(TABS) do
+    local btn = Instance.new("TextButton", tabBar)
+    btn.Size = UDim2.new(1/TAB_COUNT, 0, 1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(80, 0, 0)
+    btn.BackgroundTransparency = (name == currentTab) and 0.5 or 1
+    btn.BorderSizePixel = 0
+    btn.Text = name
+    btn.TextColor3 = (name == currentTab) and C.tabActive or C.tabIdle
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.ZIndex = 6
+    btn.LayoutOrder = i
+
+    local underline = Instance.new("Frame", btn)
+    underline.Size = UDim2.new(0.7, 0, 0, 2)
+    underline.Position = UDim2.new(0.15, 0, 1, -2)
+    underline.BackgroundColor3 = C.tabUnderline
+    underline.BorderSizePixel = 0
+    underline.Visible = (name == currentTab)
+    underline.ZIndex = 7
+
+    tabBtns[name] = {btn = btn, underline = underline}
+
+    btn.MouseEnter:Connect(function()
+        if name ~= currentTab then
+            TweenService:Create(btn, TweenInfo.new(0.1), {TextColor3 = Color3.fromRGB(220,80,80)}):Play()
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        if name ~= currentTab then
+            TweenService:Create(btn, TweenInfo.new(0.1), {TextColor3 = C.tabIdle}):Play()
+        end
+    end)
+    btn.MouseButton1Click:Connect(function()
+        currentTab = name
+        for _, n in ipairs(TABS) do
+            local t = tabBtns[n]; local active = (n == name)
+            TweenService:Create(t.btn, TweenInfo.new(0.14), {
+                TextColor3 = active and C.tabActive or C.tabIdle,
+                BackgroundColor3 = active and C.tabActiveBg or C.tabBarBg,
+            }):Play()
+            t.underline.Visible = active
+            if tabPages[n] then tabPages[n].Visible = active end
+        end
+    end)
+end
+
+-- ============================================================
+-- ROW / PAGE BUILDERS
+-- ============================================================
+local currentPage = nil; local lo = 0
+local function LO() lo = lo + 1; return lo end
+
+local function makeGap(px)
+    local f = Instance.new("Frame", currentPage)
+    f.Size = UDim2.new(1, 0, 0, px or 6)
+    f.BackgroundTransparency = 1; f.BorderSizePixel = 0; f.LayoutOrder = LO()
+end
+
+local function makeSectionHeader(label)
+    local wrap = Instance.new("Frame", currentPage)
+    wrap.Size = UDim2.new(1, 0, 0, 28)
+    wrap.BackgroundTransparency = 1; wrap.BorderSizePixel = 0; wrap.LayoutOrder = LO()
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1, -28, 1, 0)
+    lbl.Position = UDim2.new(0, 14, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label and label:upper() or ""
+    lbl.TextColor3 = C.sectionTxt
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+end
+
+local function makeInputRow(label, default, onChange)
+    local row = Instance.new("Frame", currentPage)
+    row.Size = UDim2.new(1, 0, 0, 44)
+    row.BackgroundColor3 = C.rowBg
+    row.BackgroundTransparency = 1
+    row.BorderSizePixel = 0
+    row.LayoutOrder = LO()
+
+    local div = Instance.new("Frame", row)
+    div.Size = UDim2.new(1, -28, 0, 1)
+    div.Position = UDim2.new(0, 14, 1, -1)
+    div.BackgroundColor3 = C.rowBorder; div.BorderSizePixel = 0
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -100, 1, 0)
+    lbl.Position = UDim2.new(0, 14, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label
+    lbl.TextColor3 = C.rowLabel
+    lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local boxWrap = Instance.new("Frame", row)
+    boxWrap.Size = UDim2.new(0, 70, 0, 28)
+    boxWrap.Position = UDim2.new(1, -84, 0.5, -14)
+    boxWrap.BackgroundColor3 = C.inputBg; boxWrap.BorderSizePixel = 0
+    mkCorner(boxWrap, 5)
+    local bs = mkStroke(boxWrap, C.inputBorder, 1)
+
+    local box = Instance.new("TextBox", boxWrap)
+    box.Size = UDim2.new(1, -8, 1, 0); box.Position = UDim2.new(0, 4, 0, 0)
+    box.BackgroundTransparency = 1; box.Text = tostring(default)
+    box.TextColor3 = C.inputTxt; box.Font = Enum.Font.GothamBold
+    box.TextSize = 13; box.ClearTextOnFocus = false; box.ZIndex = 8
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    box.Focused:Connect(function() TweenService:Create(bs, TweenInfo.new(0.15), {Color=C.inputFocus}):Play() end)
+    box.FocusLost:Connect(function()
+        TweenService:Create(bs, TweenInfo.new(0.15), {Color=C.inputBorder}):Play()
+        if onChange then local n = tonumber(box.Text); if n then onChange(n) else box.Text = tostring(default) end end
+    end)
+    return box, row
+end
+
+local function makeToggleRow(label, defaultOn, onToggle)
+    local row = Instance.new("Frame", currentPage)
+    row.Size = UDim2.new(1, 0, 0, 44)
+    row.BackgroundTransparency = 1; row.BorderSizePixel = 0; row.LayoutOrder = LO()
+
+    local div = Instance.new("Frame", row)
+    div.Size = UDim2.new(1, -28, 0, 1); div.Position = UDim2.new(0, 14, 1, -1)
+    div.BackgroundColor3 = C.rowBorder; div.BorderSizePixel = 0
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -70, 1, 0); lbl.Position = UDim2.new(0, 14, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = label
+    lbl.TextColor3 = C.rowLabel; lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local pillBg = Instance.new("Frame", row)
+    pillBg.Size = UDim2.new(0, 40, 0, 20); pillBg.Position = UDim2.new(1, -54, 0.5, -10)
+    pillBg.BackgroundColor3 = defaultOn and C.pillOn or C.pillOff
+    pillBg.BorderSizePixel = 0; pillBg.ZIndex = 7
+    mkCorner(pillBg, 10); mkStroke(pillBg, C.pillBorder, 1)
+
+    local dot = Instance.new("Frame", pillBg)
+    dot.Size = UDim2.new(0, 14, 0, 14)
+    dot.Position = defaultOn and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    dot.BackgroundColor3 = defaultOn and C.dotOn or C.dotOff
+    dot.BorderSizePixel = 0; dot.ZIndex = 8; mkCorner(dot, 7)
+
+    local isOn = defaultOn or false
+    local function setV(on)
+        isOn = on
+        TweenService:Create(pillBg, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {BackgroundColor3 = on and C.pillOn or C.pillOff}):Play()
+        TweenService:Create(dot, TweenInfo.new(0.18, Enum.EasingStyle.Back), {
+            Position = on and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7),
+            BackgroundColor3 = on and C.dotOn or C.dotOff
+        }):Play()
+    end
+    local function toggle() isOn = not isOn; setV(isOn); if onToggle then pcall(onToggle, isOn) end end
+
+    local clk = Instance.new("TextButton", row)
+    clk.Size = UDim2.new(1, -58, 1, 0); clk.BackgroundTransparency = 1
+    clk.Text = ""; clk.ZIndex = 5; clk.BorderSizePixel = 0
+    clk.MouseButton1Click:Connect(toggle)
+    local pClk = Instance.new("TextButton", pillBg)
+    pClk.Size = UDim2.new(1, 0, 1, 0); pClk.BackgroundTransparency = 1
+    pClk.Text = ""; pClk.ZIndex = 9; pClk.BorderSizePixel = 0
+    pClk.MouseButton1Click:Connect(toggle)
+    return setV
+end
+
+-- ============================================================
+-- KEYBIND ROW
+-- ============================================================
+local function getKeyDisplayName(kc)
+    local n = kc.Name
+    local gpNames = {
+        ButtonA="A",ButtonB="B",ButtonX="X",ButtonY="Y",
+        ButtonL1="LB",ButtonL2="LT",ButtonL3="LS",
+        ButtonR1="RB",ButtonR2="RT",ButtonR3="RS",
+        ButtonSelect="SEL",ButtonStart="STA",
+        DPadUp="D↑",DPadDown="D↓",DPadLeft="D←",DPadRight="D→",
+        Thumbstick1="LS",Thumbstick2="RS",
+    }
+    if gpNames[n] then return gpNames[n] end
+    return n:sub(1, 5)
+end
+
+local function makeKeybindRow(label, currentKey, onChanged, keyName)
+    local row = Instance.new("Frame", currentPage)
+    row.Size = UDim2.new(1, 0, 0, 44)
+    row.BackgroundTransparency = 1; row.BorderSizePixel = 0; row.LayoutOrder = LO()
+
+    local div = Instance.new("Frame", row)
+    div.Size = UDim2.new(1, -28, 0, 1); div.Position = UDim2.new(0, 14, 1, -1)
+    div.BackgroundColor3 = C.rowBorder; div.BorderSizePixel = 0
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -80, 1, 0); lbl.Position = UDim2.new(0, 14, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = label
+    lbl.TextColor3 = C.rowLabel; lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local kbtn = Instance.new("TextButton", row)
+    kbtn.Size = UDim2.new(0, 52, 0, 26); kbtn.Position = UDim2.new(1, -64, 0.5, -13)
+    kbtn.BackgroundColor3 = C.chipBg; kbtn.BorderSizePixel = 0
+    kbtn.Text = getKeyDisplayName(currentKey); kbtn.TextColor3 = C.chipTxt
+    kbtn.Font = Enum.Font.GothamBold; kbtn.TextSize = 11; kbtn.ZIndex = 8
+    mkCorner(kbtn, 5); local ks = mkStroke(kbtn, C.chipBorder, 1)
+
+    local listening = false; local lconnKeyboard = nil; local lconnGamepad = nil
+    local function stopL(key)
+        listening = false
+        if lconnKeyboard then lconnKeyboard:Disconnect(); lconnKeyboard = nil end
+        if lconnGamepad  then lconnGamepad:Disconnect();  lconnGamepad = nil  end
+        TweenService:Create(ks, TweenInfo.new(0.12), {Color=C.chipBorder}):Play()
+        kbtn.TextColor3 = C.chipTxt
+        if key then
+            kbtn.Text = getKeyDisplayName(key)
+            if onChanged then onChanged(key) end
+            task.spawn(function() if saveConfig then pcall(saveConfig) end end)
+        end
+    end
+    kbtn.MouseButton1Click:Connect(function()
+        if listening then stopL(nil); return end
+        listening = true; kbtn.Text = "···"; kbtn.TextColor3 = C.inputTxt
+        TweenService:Create(ks, TweenInfo.new(0.12), {Color=C.inputFocus}):Play()
+        lconnKeyboard = UIS.InputBegan:Connect(function(inp)
+            if not listening then return end
+            if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            if inp.KeyCode == Enum.KeyCode.Escape then stopL(nil); return end
+            stopL(inp.KeyCode)
+        end)
+        lconnGamepad = UIS.InputBegan:Connect(function(inp)
+            if not listening then return end
+            if inp.UserInputType ~= Enum.UserInputType.Gamepad1
+            and inp.UserInputType ~= Enum.UserInputType.Gamepad2
+            and inp.UserInputType ~= Enum.UserInputType.Gamepad3
+            and inp.UserInputType ~= Enum.UserInputType.Gamepad4 then return end
+            local kc = inp.KeyCode; if kc == Enum.KeyCode.Unknown then return end
+            stopL(kc)
+        end)
+    end)
+    if keyName then keybindBtnRefs[keyName] = kbtn end
+    return kbtn
+end
+
+-- ============================================================
+-- BUILD PAGES
+-- ============================================================
+local function buildPage(tabName, buildFn)
+    local page = Instance.new("ScrollingFrame", contentBg)
+    page.Name = tabName; page.Visible = (tabName == "Speed")
+    page.Size = UDim2.new(1, 0, 1, 0); page.Position = UDim2.new(0, 0, 0, 0)
+    page.BackgroundTransparency = 1; page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.ScrollBarImageColor3 = C.accent
+    page.ScrollBarImageTransparency = 0.4
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y; page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    local ll = Instance.new("UIListLayout", page)
+    ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Padding = UDim.new(0, 0)
+    tabPages[tabName] = page; currentPage = page; lo = 0
+    buildFn()
+    currentPage = nil
+end
+
+-- ============================================================
+-- SPEED PAGE
+-- ============================================================
+buildPage("Speed", function()
+    makeGap(2)
+    makeSectionHeader("Speed Settings")
+    makeGap(2)
+
+    normalBox = makeInputRow("Normal Speed", State.normalSpeed, function(n)
+        if n > 0 and n <= 500 then State.normalSpeed = n end
+    end)
+    carryBox = makeInputRow("Carry Speed", State.carrySpeed, function(n)
+        if n > 0 and n <= 500 then State.carrySpeed = n end
+    end)
+    laggerBox = makeInputRow("Lagger Speed", State.laggerSpeed, function(n)
+        if n > 0 and n <= 500 then State.laggerSpeed = n end
+    end)
+
+    makeGap(6)
+
+    local modeRow = Instance.new("Frame", currentPage)
+    modeRow.Size = UDim2.new(1, 0, 0, 48)
+    modeRow.BackgroundTransparency = 1; modeRow.BorderSizePixel = 0; modeRow.LayoutOrder = LO()
+
+    local modeWrap = Instance.new("Frame", modeRow)
+    modeWrap.Size = UDim2.new(1, -28, 0, 34)
+    modeWrap.Position = UDim2.new(0, 14, 0, 7)
+    modeWrap.BackgroundColor3 = C.modeBtnBg; modeWrap.BorderSizePixel = 0
+    mkCorner(modeWrap, 7); mkStroke(modeWrap, C.modeBtnBrd, 1)
+
+    local modeLL = Instance.new("UIListLayout", modeWrap)
+    modeLL.FillDirection = Enum.FillDirection.Horizontal
+    modeLL.SortOrder = Enum.SortOrder.LayoutOrder; modeLL.Padding = UDim.new(0, 0)
+
+    local modeStatusRow = Instance.new("Frame", currentPage)
+    modeStatusRow.Size = UDim2.new(1, 0, 0, 24)
+    modeStatusRow.BackgroundTransparency = 1; modeStatusRow.BorderSizePixel = 0; modeStatusRow.LayoutOrder = LO()
+    local modeStatusLbl = Instance.new("TextLabel", modeStatusRow)
+    modeStatusLbl.Size = UDim2.new(1, -28, 1, 0); modeStatusLbl.Position = UDim2.new(0, 14, 0, 0)
+    modeStatusLbl.BackgroundTransparency = 1; modeStatusLbl.Text = "Mode: Normal"
+    modeStatusLbl.TextColor3 = C.rowSub; modeStatusLbl.Font = Enum.Font.Gotham
+    modeStatusLbl.TextSize = 11; modeStatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local modeNames = {"Normal", "Carry", "Lagger"}
+    local modeBtns = {}
+    local function setModeActive(active)
+        for _, m in ipairs(modeNames) do
+            local b = modeBtns[m]; if not b then continue end
+            local isActive = (m == active)
+            TweenService:Create(b, TweenInfo.new(0.15), {
+                BackgroundColor3 = isActive and C.modeBtnActBg or Color3.fromRGB(0,0,0),
+                BackgroundTransparency = isActive and 0 or 1,
+                TextColor3 = isActive and C.modeBtnActTx or C.modeBtnTxt,
+            }):Play()
+        end
+        modeStatusLbl.Text = "Mode: " .. active
+        if active == "Normal" then
+            State.speedToggled = false; State.laggerEnabled = false
+            if stackBtnRefs.carrySpeed then stackBtnRefs.carrySpeed.setOn(false) end
+            if stackBtnRefs.lagger then stackBtnRefs.lagger.setOn(false) end
+        elseif active == "Carry" then
+            State.speedToggled = true; State.laggerEnabled = false
+            if stackBtnRefs.carrySpeed then stackBtnRefs.carrySpeed.setOn(true) end
+            if stackBtnRefs.lagger then stackBtnRefs.lagger.setOn(false) end
+        elseif active == "Lagger" then
+            State.speedToggled = false; State.laggerEnabled = true
+            if stackBtnRefs.carrySpeed then stackBtnRefs.carrySpeed.setOn(false) end
+            if stackBtnRefs.lagger then stackBtnRefs.lagger.setOn(true) end
+        end
+    end
+
+    for i, mname in ipairs(modeNames) do
+        local b = Instance.new("TextButton", modeWrap)
+        b.Size = UDim2.new(1/3, 0, 1, 0)
+        b.BackgroundColor3 = (i == 1) and C.modeBtnActBg or Color3.fromRGB(0,0,0)
+        b.BackgroundTransparency = (i == 1) and 0 or 1
+        b.BorderSizePixel = 0; b.Text = mname
+        b.TextColor3 = (i == 1) and C.modeBtnActTx or C.modeBtnTxt
+        b.Font = Enum.Font.GothamBold; b.TextSize = 12; b.ZIndex = 8
+        b.LayoutOrder = i; mkCorner(b, 5)
+        b.MouseButton1Click:Connect(function() setModeActive(mname) end)
+        modeBtns[mname] = b
+    end
+
+    makeGap(6)
+    makeSectionHeader("Keybinds")
+    makeGap(2)
+    makeKeybindRow("Speed Key", Keys.speed, function(k) Keys.speed = k end, "speed")
+    makeKeybindRow("Lagger Key", Keys.lagger, function(k) Keys.lagger = k end, "lagger")
+end)
+
+-- ============================================================
+-- BAT AIMBOT PAGE
+-- ============================================================
+buildPage("Bat Aimbot", function()
+    makeGap(2)
+    makeSectionHeader("Aimbot")
+    makeGap(2)
+    setAutoSwing = makeToggleRow("Auto Swing", false, function(on) State.autoSwingEnabled = on end)
+    setBatCounter = makeToggleRow("Bat Counter", false, function(on)
+        State.batCounterEnabled = on
+        if on then startBatCounter() else stopBatCounter() end
+    end)
+    makeGap(8)
+    makeSectionHeader("Keybinds")
+    makeGap(2)
+    makeKeybindRow("Aimbot Key", Keys.aimbot, function(k) Keys.aimbot = k end, "aimbot")
+end)
+
+-- ============================================================
+-- MECHANICS PAGE
+-- ============================================================
+buildPage("Mechanics", function()
+    makeGap(2)
+    makeSectionHeader("Stealing")
+    makeGap(2)
+    setInstaGrab = makeToggleRow("Insta Grab", false, function(on)
+        Steal.AutoStealEnabled = on
+        if on then if not pcall(startAutoSteal) then Steal.AutoStealEnabled = false; setInstaGrab(false) end
+        else stopAutoSteal() end
+    end)
+    stealRadBox = makeInputRow("Steal Radius", Steal.StealRadius, function(n)
+        if n >= 5 and n <= 300 then Steal.StealRadius = math.floor(n); Steal.cachedPrompts = {}; Steal.promptCacheTime = 0
+            if radTB and not radTB:IsFocused() then radTB.Text = tostring(Steal.StealRadius) end end
+    end)
+    makeInputRow("Steal Duration", Steal.StealDuration, function(n)
+        if n >= 0.05 and n <= 2 then Steal.StealDuration = n end
+    end)
+    makeGap(8)
+    makeSectionHeader("Combat / Defense")
+    makeGap(2)
+    setInfJump = makeToggleRow("Infinite Jump", false, function(on) State.infJumpEnabled = on end)
+    setAntiRag = makeToggleRow("Anti Ragdoll", false, function(on)
+        State.antiRagdollEnabled = on; if on then startAntiRagdoll() else stopAntiRagdoll() end
+    end)
+    setFps = makeToggleRow("FPS Boost", false, function(on)
+        State.fpsBoostEnabled = on; if on then pcall(applyFPSBoost) end
+    end)
+    setMedusaCounter = makeToggleRow("Medusa Counter", false, function(on)
+        State.medusaCounterEnabled = on
+        if on then setupMedusaCounter(LP.Character) else stopMedusaCounter() end
+    end)
+    setUnwalkToggle = makeToggleRow("Unwalk", false, function(on)
+        State.unwalkEnabled = on
+        if on then startUnwalk() else stopUnwalk() end
+    end)
+end)
+
+-- ============================================================
+-- MOVEMENT PAGE
+-- ============================================================
+buildPage("Movement", function()
+    makeGap(2)
+    makeSectionHeader("Auto Movement")
+    makeGap(2)
+    makeKeybindRow("Auto Left", Keys.autoLeft, function(k) Keys.autoLeft = k end, "autoLeft")
+    makeKeybindRow("Auto Right", Keys.autoRight, function(k) Keys.autoRight = k end, "autoRight")
+    makeGap(8)
+
+    makeSectionHeader("Duel Countdown")
+    makeGap(2)
+
+    local duelDir = "left"
+    local dirRow = Instance.new("Frame", currentPage)
+    dirRow.Size = UDim2.new(1, 0
